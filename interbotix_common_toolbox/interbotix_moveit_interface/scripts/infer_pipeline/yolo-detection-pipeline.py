@@ -15,6 +15,7 @@ import numpy as np
 import pyrealsense2 as rs
 from ultralytics import YOLO
 
+import math
 import rospy
 from std_msgs.msg import String
 
@@ -24,27 +25,8 @@ from rospy_tutorials.msg import Floats
 global action
 global target_object_id
 
-# Check the number of arguments passed
-num_args = len(sys.argv) - 1
-if num_args == 0:
-    print("No action id and target id arguments were passed. Exiting...")
-    sys.exit(1)
-elif num_args == 1:
-    # One additional argument passed
-    if int(sys.argv[1]) == 0:
-        print(f"Action code is 0. Gipping, but no target id is passed, Exiting...")
-        sys.exit(1)
-    elif int(sys.argv[1]) == 1:
-        print(f"Action code is 1. Ironing")
-        action = sys.argv[1]
-elif num_args == 2:
-    if int(sys.argv[1]) == 0:
-        print(f"Action code is 0. Gipping, the target onject id is " + str(sys.argv[2]))
-        action = sys.argv[1]
-        target_object_id = sys.argv[2]
-else:
-    print("Too many arguments passed. Exiting...")
-    sys.exit(1)
+action = sys.argv[1]
+target_object_id = sys.argv[2]
 
 # fill up your yolo .pt file
 model = YOLO("/home/xbot/xbot/infer-pipeline/model/yolov8n.pt") 
@@ -99,51 +81,98 @@ def get_aligned_images():
     depth_colormap = cv2.applyColorMap(
                 cv2.convertScaleAbs(depth_image, alpha=0.07), cv2.COLORMAP_JET)
     return depth_intri, depth_frame, color_image
+
+def need_move(coord1, coord2, threshold=0.1):
+    # Helper function to calculate the Euclidean distance between two points
+    if abs(coord2[0]) == 0 and abs(coord2[1]) == 0 and abs(coord2[2]) == 0:
+        return False
+    def euclidean_distance(point1, point2):
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(point1, point2)))
+    
+    # Calculate the distance between the two points
+    distance = euclidean_distance(coord1, coord2)
+
+    # Check if the distance is greater than the threshold
+    return distance > threshold
+
+def is_stable(position_list, threshold=0.1):
+    reference_coordinate = position_list[0]
+    # Check each coordinate against the reference coordinate
+    for coordinate in position_list:
+        if not all(abs(c - r) <= threshold for c, r in zip(coordinate, reference_coordinate)):
+            return False
+    return True
+
+def avg_coord(position_list):
+    sum_x, sum_y, sum_z = 0, 0, 0
+    # Sum up all coordinates in each direction
+    for coordinate in position_list:
+        sum_x += coordinate[0]
+        sum_y += coordinate[1]
+        sum_z += coordinate[2]
+    # Calculate the average for each direction
+    avg_x = sum_x / len(position_list)
+    avg_y = sum_y / len(position_list)
+    avg_z = sum_z / len(position_list)
+    # Return the average coordinate
+    return [avg_x, avg_y, avg_z]
  
 if __name__ == '__main__':
     try:
         # while True:
+        last_position = [0, 0, 0]
+        position_list = []
         while not rospy.is_shutdown():
+
             depth_intri, depth_frame, color_image = get_aligned_images()
             source = [color_image]
 
-            if int(action) == 0:
-                results = model.predict(source, save=False, classes=int(target_object_id))
+            results = model.predict(source, save=False, classes=int(target_object_id))
 
-                for result in results:
-                    boxes = result.boxes.xywh.tolist()
-                    im_array = result.plot()
+            for result in results:
+                boxes = result.boxes.xywh.tolist()
+                im_array = result.plot()
+                
+                for i in range(len(boxes)):
+                    ux, uy = int(boxes[i][0]), int(boxes[i][1])
                     
-                    for i in range(len(boxes)):
-                        ux, uy = int(boxes[i][0]), int(boxes[i][1])
-                        
-                        # center of the bounding-box
-                        dis = depth_frame.get_distance(ux, uy)
-                        camera_xyz = rs.rs2_deproject_pixel_to_point(
-                            depth_intri, (ux, uy), dis)
+                    # center of the bounding-box
+                    dis = depth_frame.get_distance(ux, uy)
+                    camera_xyz = rs.rs2_deproject_pixel_to_point(
+                        depth_intri, (ux, uy), dis)
 
-                        camera_xyz = np.round(np.array(camera_xyz), 3)
-                        
-                        # pos_pub.publish(str(camera_coordinate))
+                    camera_xyz = np.round(np.array(camera_xyz), 3)
+                    
+                    # pos_pub.publish(str(camera_coordinate))
+                    if abs(camera_xyz[0]) != 0 and abs(camera_xyz[1]) != 0 and abs(camera_xyz[2]) != 0:
                         print("camera_xyz : ", camera_xyz)
+                        position_list.append([camera_xyz[0], camera_xyz[1], camera_xyz[2]])
 
-                        array_data = np.array([camera_xyz[0], camera_xyz[1], camera_xyz[2], int(action)], dtype=np.float32)
-                        pos_pub.publish(array_data)
-                        
-                        # from meter to mm
-                        camera_xyz = camera_xyz * 1000
+                    if len(position_list) > 20:
+                        if is_stable(position_list):
+                            print("collected: ", position_list)
+                            curr_position = avg_coord(position_list)
 
-                        camera_xyz = list(camera_xyz)
+                            if need_move(last_position, curr_position):
+                                array_data = np.array([curr_position[0], curr_position[1], curr_position[2], int(action)], dtype=np.float32)
+                                pos_pub.publish(array_data)
+                                print("publishing: ", array_data)
+                                last_position = curr_position
 
-                        # Draw the center point
-                        cv2.circle(im_array, (ux, uy), 4, (255, 255, 255), 5)
+                            position_list = []
+                        else:
+                            position_list = []
+                    
+                    # from meter to mm
+                    camera_xyz = camera_xyz * 1000
 
-                        cv2.putText(im_array, str(camera_xyz), (ux + 20, uy + 10), 0, 0.5,
-                                    [225, 255, 255], thickness=1, lineType=cv2.LINE_AA)
-            elif int(action) == 1:
-                # TODO
-                # QR code detection, simulate ironing
-                pass
+                    camera_xyz = list(camera_xyz)
+
+                    # Draw the center point
+                    cv2.circle(im_array, (ux, uy), 4, (255, 255, 255), 5)
+
+                    cv2.putText(im_array, str(camera_xyz), (ux + 20, uy + 10), 0, 0.5,
+                                [225, 255, 255], thickness=1, lineType=cv2.LINE_AA)
             
             cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
             cv2.imshow('RealSense', im_array)

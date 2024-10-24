@@ -8,6 +8,7 @@ import math
 from rospy.numpy_msg import numpy_msg
 from rospy_tutorials.msg import Floats
 import sys
+import pdb
 
 import tf
 from geometry_msgs.msg import PointStamped, Pose
@@ -22,10 +23,6 @@ from tf.transformations import quaternion_from_euler
 from moveit_commander.conversions import pose_to_list
 
 from interbotix_xs_modules.arm import InterbotixManipulatorXS
-
-import time
-last_time = 0
-last_position = [0, 0, 0]
 
 def all_close(goal, actual, tolerance):
   """
@@ -49,16 +46,25 @@ def all_close(goal, actual, tolerance):
 
   return True
 
-def need_move(coord1, coord2, threshold=0.001):
-    # Helper function to calculate the Euclidean distance between two points
-    def euclidean_distance(point1, point2):
-        return math.sqrt(sum((a - b) ** 2 for a, b in zip(point1, point2)))
+def is_sleep(coord, threshold=0.1):
+    x, y, z = coord
+    x0, y0, z0 =  0.12304939949053458, -0.0007257176085502557, 0.08037000092795657
     
-    # Calculate the distance between the two points
-    distance = euclidean_distance(coord1, coord2)
+    is_within_x = abs(x - x0) <= threshold
+    is_within_y = abs(y - y0) <= threshold
+    is_within_z = abs(z - z0) <= threshold
 
-    # Check if the distance is greater than the threshold
-    return distance > threshold
+    return is_within_x and is_within_y and is_within_z
+
+def is_home(coord, threshold=0.1):
+    x, y, z = coord
+    x0, y0, z0 =  0.4615700915319481, -0.0014175763595525664, 0.3380719512384799
+    
+    is_within_x = abs(x - x0) <= threshold
+    is_within_y = abs(y - y0) <= threshold
+    is_within_z = abs(z - z0) <= threshold
+
+    return is_within_x and is_within_y and is_within_z
 
 def pose_transform(position=[], orientation=[]):
     pose = Pose()
@@ -114,13 +120,11 @@ def coordinate_transform(x_axis, y_axis, z_axis):
     return pose_robot_base_frame
 
 def pose_callback(msg):
-    global last_time
-    global last_position
-    current_time = time.time()
-    
-    # sampling every 20s
-    if current_time - last_time >= 20:
+    current_position = [float(arr[0]) for arr in bot.arm.get_ee_pose()[0:3, 3:4]]
+
+    if is_sleep(current_position):
         python_list = msg.data.tolist()
+
         rospy.loginfo("Received data converted to list: %s", python_list)
         pose_goal = coordinate_transform(python_list[0], python_list[1], python_list[2])
         rospy.loginfo(pose_goal)
@@ -131,43 +135,42 @@ def pose_callback(msg):
         # 1: iron
         exec = python_list[3]
 
-        # 1. if the next pose is same to current one, do not move
-        if need_move(last_position, target_position):
         # 2. if move:
-        #   2.1 move to the 10 cm above of the item
+    #   2.1 move to the 10 cm above of the item
+        target_position[2] += 0.1 
+    #       pose_goal.position.z += 0.1
+        if exec == 0:
+            bot.arm.set_ee_pose_components(x = target_position[0], y = target_position[1], z = target_position[2], pitch=1)
+        #   grip
+        #   2.2 open the gripper
+            bot.gripper.open()
+        #   2.3 move to the item real coordinates
+            target_position[2] -= 0.1
+            bot.arm.set_ee_pose_components(x = target_position[0], y = target_position[1], z = target_position[2], pitch=1) 
+        #       pose_goal.position.z -= 0.1
+        #   2.4 close the gripper
+            bot.gripper.close()
             target_position[2] += 0.1 
-            bot.arm.set_ee_pose_components(x = target_position[0], y = target_position[1], z = target_position[2], pitch=0.5)
-        #       pose_goal.position.z += 0.1
-            if exec == 0:
-            #   grip
-            #   2.2 open the gripper
-                bot.gripper.open()
-            #   2.3 move to the item real coordinates
-                target_position[2] -= 0.1
-                bot.arm.set_ee_pose_components(x = target_position[0], y = target_position[1], z = target_position[2], pitch=0.5) 
-            #       pose_goal.position.z -= 0.1
-            #   2.4 close the gripper
-                bot.gripper.close()
-            #   2.5 move to the pre-defined coorinnate
-                bot.arm.go_to_home_pose()
-                bot.gripper.open()
-            else:
-            # ironing
-                # default 90 degree
-                bot.arm.set_ee_cartesian_trajectory(pitch=1.5)
-                bot.arm.set_ee_cartesian_trajectory(z=-0.1)
+            bot.arm.set_ee_pose_components(x = target_position[0], y = target_position[1], z = target_position[2], pitch=1) 
+        #   2.5 move to the pre-defined coorinnate
+            bot.arm.go_to_home_pose()
+            bot.gripper.open()
+        else:
+        # ironing
+            # default 90 degree
+            bot.arm.set_ee_pose_components(x = target_position[0], y = target_position[1], z = target_position[2])
+            bot.arm.set_ee_cartesian_trajectory(pitch=1.5)
+            bot.arm.set_ee_cartesian_trajectory(z=-0.05)
 
-                # move back/forth
-                bot.arm.set_ee_cartesian_trajectory(x=0.1)
-                for i in range(2):
-                    bot.arm.set_ee_cartesian_trajectory(x=-0.2)
-                    bot.arm.set_ee_cartesian_trajectory(x=0.2)
-                
-                bot.arm.go_to_home_pose()
+            # move back/forth
+            bot.arm.set_ee_cartesian_trajectory(x=0.1)
+            for i in range(1):
+                bot.arm.set_ee_cartesian_trajectory(x=-0.2)
+                bot.arm.set_ee_cartesian_trajectory(x=0.2)
+            
+            bot.arm.go_to_home_pose()
 
-        bot.arm.go_to_sleep_pose()
-        last_position = target_position
-        last_time = current_time
+        bot.arm.go_to_sleep_pose()\
 
 def go_to_pose_goal(group, pose_goal):
 
